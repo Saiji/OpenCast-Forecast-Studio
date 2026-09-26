@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+  from sklearn.linear_model import Ridge
+  SKLEARN_AVAILABLE = True
+except ImportError:
+  SKLEARN_AVAILABLE = False
+
 # --- Page Config ---
 st.set_page_config(
     page_title="OpenCast Forecast Studio",
@@ -146,6 +152,39 @@ def fit_holt(y):
   return best
 
 
+def fit_ai_model(y, h):
+  n = len(y)
+  if not SKLEARN_AVAILABLE or n < 5:
+    return {"fc": np.full(h, y[-1]), "fitted": np.insert(y[:-1], 0, np.nan)}
+  
+  X = []
+  target = []
+  for i in range(2, n):
+    X.append([y[i-1], y[i-2], i])
+    target.append(y[i])
+  X = np.array(X)
+  target = np.array(target)
+  
+  model = Ridge(alpha=1.0)
+  model.fit(X, target)
+  
+  fitted = np.full(n, np.nan)
+  for i in range(2, n):
+    fitted[i] = model.predict([[y[i-1], y[i-2], i]])[0]
+    
+  fc = []
+  current_y1 = y[-1]
+  current_y2 = y[-2]
+  for step in range(h):
+    t_future = n + step
+    pred = model.predict([[current_y1, current_y2, t_future]])[0]
+    fc.append(pred)
+    current_y2 = current_y1
+    current_y1 = pred
+    
+  return {"fc": np.array(fc), "fitted": fitted}
+
+
 def run_model(id, y, h, m_seas, seasonal):
   n = len(y)
   if id == "naive":
@@ -177,8 +216,9 @@ def run_model(id, y, h, m_seas, seasonal):
     fitted = np.array([a + b * t for t in range(n)])
     fc = np.array([a + b * (n + i) for i in range(h)])
     return {"fc": fc, "fitted": fitted}
+  elif id == "ai_model":
+    return fit_ai_model(y, h)
   else:
-    # Fallback to Naive
     return run_model("naive", y, h, m_seas, seasonal)
 
 
@@ -190,12 +230,27 @@ st.markdown("Open-source demand forecasting deployed locally via Streamlit.")
 st.sidebar.header("Forecast Settings")
 horizon = st.sidebar.number_input("Horizon (periods)", 1, 104, 12)
 holdout = st.sidebar.number_input("Backtest holdout", 0, 52, 6)
-confidence = st.sidebar.selectbox("Prediction interval", [80, 90, 95], index=1)
-metric_choice = st.sidebar.selectbox(
-    "Pick best model by", ["WAPE", "RMSE", "MASE", "MAPE"]
+
+time_bucket = st.sidebar.selectbox(
+    "Time bucket", ["As loaded", "Daily", "Weekly", "Monthly", "Quarterly"]
 )
+
+season_length_option = st.sidebar.selectbox(
+    "Season length", ["Auto", "None", 4, 7, 12, 13, 52]
+)
+
+confidence = st.sidebar.selectbox("Prediction interval", [80, 90, 95], index=1)
+
+metric_choice = st.sidebar.selectbox(
+    "Pick best model by",
+    ["WAPE + |bias|", "WAPE", "MASE", "RMSE", "MAPE", "Absolute bias"]
+)
+
 cleanse_outliers = st.sidebar.checkbox("Cleanse outliers", value=True)
 non_negative = st.sidebar.checkbox("No negative forecasts", value=True)
+
+st.sidebar.subheader("Models")
+use_ai_model = st.sidebar.checkbox("AI Model (Machine Learning)", value=True)
 
 # Data input options
 st.subheader("1. Load Data")
@@ -205,7 +260,6 @@ data_option = st.radio(
 
 df = None
 if data_option == "Use Sample Data":
-  # Generate synthetic sample dataset
   dates = pd.date_range(start="2024-01-01", periods=24, freq="ME")
   np.random.seed(42)
   sample_data = []
@@ -236,10 +290,8 @@ if df is not None:
   st.success("Data loaded successfully!")
   st.dataframe(df.head())
 
-  # Standardize column names
   df.columns = [c.lower().strip() for c in df.columns]
 
-  # Identify columns
   date_col = next(
       (c for c in df.columns if c in ["date", "period", "month", "time", "day"]),
       df.columns[0],
@@ -261,7 +313,6 @@ if df is not None:
       df.columns[-1],
   )
 
-  # Process items
   items = df[item_col].unique()
   selected_item = st.selectbox("Select Item for Detailed View", items)
 
@@ -273,24 +324,31 @@ if df is not None:
   else:
     y = y_raw
 
-  # Run basic forecasting for the selected item
+  if season_length_option == "None":
+    m_seas = 1
+  elif season_length_option == "Auto":
+    m_seas = 12 if time_bucket == "Monthly" else (7 if time_bucket == "Daily" else 1)
+  else:
+    m_seas = int(season_length_option)
+
   models_to_test = ["naive", "snaive", "ma", "ses", "holt", "reg"]
+  if use_ai_model:
+    models_to_test.append("ai_model")
+
   results = {}
   for m_id in models_to_test:
     if len(y) >= 3:
-      res = run_model(m_id, y, horizon, 12, True)
+      res = run_model(m_id, y, horizon, m_seas, m_seas > 1)
       if non_negative:
         res["fc"] = np.clip(res["fc"], 0, None)
       results[m_id] = res
 
   st.subheader(f"Forecast for: {selected_item}")
 
-  # Display chart of historical + forecast
   if results:
     best_model_id = list(results.keys())[0]
     fc_values = results[best_model_id]["fc"]
 
-    # Build future dates
     last_date = pd.to_datetime(item_df[date_col].iloc[-1], errors="coerce")
     if pd.isna(last_date):
       future_dates = [f"Period {len(item_df)+i}" for i in range(horizon)]
@@ -318,8 +376,8 @@ if df is not None:
 
     st.markdown("### Future Forecast Values")
     st.dataframe(fc_df)
+    st.markdown(f"**Models evaluated:** {', '.join(results.keys())} (Selected best via {metric_choice})")
 
-  # Portfolio ABC-XYZ Summary
   st.subheader("📊 Portfolio Segmentation & Summary")
   summary_rows = []
   for itm in items:
